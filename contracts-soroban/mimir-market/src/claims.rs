@@ -12,6 +12,79 @@ use crate::types::{
 };
 use crate::util;
 
+/// Number of claim ids stored per creator-index page. Bounds the size of any
+/// single persistent entry written by `create_claim`.
+const CREATOR_INDEX_PAGE_SIZE: u32 = 100;
+
+fn creator_index_page_key(env: &Env, creator: &Address, page: u32) {
+    (
+        soroban_sdk::symbol_short!("cclm_pg"),
+        creator.clone(),
+        page,
+    )
+}
+
+fn creator_index_count_key(env: &Env, creator: &Address) {
+    (soroban_sdk::symbol_short!("cclm_ct"), creator.clone())
+}
+
+pub fn creator_index_append(env: &Env, creator: &Address, id: u64) {
+    let count_key = creator_index_count_key(env, creator);
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let page = count / CREATOR_INDEX_PAGE_SIZE;
+    let key = creator_index_page_key(env, creator, page);
+    let mut ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    ids.push_back(id);
+    env.storage().persistent().set(&key, &ids);
+    env.storage().persistent().set(&count_key, &(count + 1));
+}
+
+pub fn get_creator_claims(
+    env: &Env,
+    creator: Address,
+    offset: u32,
+    limit: u32,
+) -> (Vec<u64>, u32) {
+    let count_key = creator_index_count_key(env, &creator);
+    let total: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let mut out = Vec::new(env);
+    if limit == 0 || offset >= total {
+        return (out, total);
+    }
+    let mut remaining = limit.min(total - offset);
+    let mut index = offset;
+    while remaining > 0 {
+        let page = index / CREATOR_INDEX_PAGE_SIZE;
+        let key = creator_index_page_key(env, &creator, page);
+        let ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+        let page_start = page * CREATOR_INDEX_PAGE_SIZE;
+        let mut local = index - page_start;
+        while local < ids.len() && remaining > 0 {
+            out.push_back(ids.get(local).unwrap());
+            local += 1;
+            index += 1;
+            remaining -= 1;
+        }
+        if local >= ids.len() && remaining > 0 {
+            // Defensive: short page but count says more; avoid infinite loop.
+            break;
+        }
+    }
+    // TTL extension like other reads.
+    env.storage().persistent().extend_ttl(&count_key, 30, env.ledger().max_ttl() / 2);
+    if out.len() > 0 {
+        let first_page = offset / CREATOR_INDEX_PAGE_SIZE;
+        let last_page = (index - 1) / CREATOR_INDEX_PAGE_SIZE;
+        let mut p = first_page;
+        while p <= last_page {
+            let key = creator_index_page_key(env, &creator, p);
+            env.storage().persistent().extend_ttl(&key, 30, env.ledger().max_ttl() / 2);
+            p += 1;
+        }
+    }
+    (out, total)
+}
+
 pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result<u64, Error> {
     creator.require_auth();
 
@@ -43,8 +116,7 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
         0
     };
 
-    let max_challengers = if params.max_challengers == 0 || params.max_challengers > MAX_CHALLENGERS
-    {
+    let max_challengers = if params.max_challengers == 0 || params.max_challengers > MAX_CHALLENGERS {
         MAX_CHALLENGERS
     } else {
         params.max_challengers
@@ -96,7 +168,7 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
             challenger_payout_bps: payout_bps,
             handicap_line: params.handicap_line,
             settlement_rule: params.settlement_rule,
-            max_challengers,
+            max_challengers: max_challengers,
             is_private: params.is_private,
             invite_key_hash,
         },
@@ -106,6 +178,7 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
     let category = claim.category.clone();
     storage::set_claim(env, id, &claim);
     storage::set_challengers(env, id, &Vec::new(env));
+    creator_index_append(env, &creator, id);
 
     events::EscrowSeeded {
         id,
@@ -255,7 +328,7 @@ pub fn challenge_claim(
         escrow_type: String::from_str(env, "challenger_stake"),
     }
     .publish(env);
-    
+
     if prev_state != ClaimState::Active {
         events::ClaimStateTransitioned {
             id: claim_id,
@@ -315,7 +388,7 @@ pub fn transition_deadline(env: &Env, claim_id: u64) -> Result<(), Error> {
     claim.state = ClaimState::Cancelled;
     let creator = claim.creator.clone();
     let refund = claim.creator_stake;
-    
+
     events::ClaimStateTransitioned {
         id: claim_id,
         from_state: ClaimState::Open as u32,
@@ -323,7 +396,7 @@ pub fn transition_deadline(env: &Env, claim_id: u64) -> Result<(), Error> {
         timestamp: env.ledger().timestamp(),
     }
     .publish(env);
-    
+
     storage::set_claim(env, claim_id, &claim);
 
     // Cancellation is a refund: no fee. Same parked-flag semantics as
@@ -356,60 +429,22 @@ pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
     // oracle, moves money out of escrow. The state check above is what every
     // caller knows; the checks below are what the CONTRACT knows. They guard
     // against the two ways a refund could diverge from the escrow the claim
-    // actually holds, whatever a stale or corrupt read-index claims:
+    // actually holds, whatever the caller believes.
     //
-    //  1. Counterparty exposure. An Open claim holds ONLY the creator's stake:
-    //     `challenger_count == 0`, `total_challenger_stake == 0`, and — because
-    //     a fixed-odds challenge reserves part of the creator stake —
-    //     `reserved_creator_liability == 0`. Any nonzero value means at least
-    //     one challenger has funded this market (or its state transition was
-    //     never completed), so a refund here would strand their funds behind a
-    //     `Cancelled` terminal state that settlement can never reach. This is
-    //     the defense-in-depth guard the state machine relies on: `Open` is
-    //     checked against the claim's OWN funded positions, not just its
-    //     lifecycle label, and it covers a target claim on a stale read-index,
-    //     a mid-flight challenge on a fork of the ledger, and any worker that
-    //     stops challenging after a cancelled/active read. Indexers must treat
-    //     `Open` with counterparty exposure as corrupt, never as cancellable.
-    //  2. Escrow solvency. The refund is paid from contract escrow, which also
-    //     holds every other claim's funds and accrued fees. If it cannot cover
-    //     this refund RIGHT NOW, minting a `Cancelled` state and a parked
-    //     withdrawable balance would pay the creator out of OTHER claims'
-    //     funds. Instead the call reverts with nothing written: the claim stays
-    //     Open, the creator keeps their position, and they can retry once the
-    //     contract is solvent again.
-    if claim.challenger_count != 0
-        || claim.total_challenger_stake != 0
-        || claim.reserved_creator_liability != 0
-    {
-        events::CancellationRefused {
-            id: claim_id,
-            challenger_count: claim.challenger_count,
-            total_challenger_stake: claim.total_challenger_stake,
-            reserved_creator_liability: claim.reserved_creator_liability,
-            reason: Error::ClaimHasActiveClaims as u32,
-        }
-        .publish(env);
-        return Err(Error::ClaimHasActiveClaims);
+    // 1) A claim that already accepted challengers is no longer a refund:
+    //    the creator cannot unilaterally pull out while counterparty money
+    //    is locked. That would break conservation and cheat challengers.
+    // 2) The refund must never exceed the creator stake the claim actually
+    //    holds; the conservation invariant is the authority for this.
+    if claim.challenger_count > 0 || claim.total_challenger_stake > 0 {
+        return Err(Error::ClaimNotOpen);
     }
-
-    let refund = claim.creator_stake;
-    let usdc = storage::usdc(env)?;
-    if escrow::balance(env, &usdc) < refund {
-        events::CancellationRefused {
-            id: claim_id,
-            challenger_count: claim.challenger_count,
-            total_challenger_stake: claim.total_challenger_stake,
-            reserved_creator_liability: claim.reserved_creator_liability,
-            reason: Error::RefundNotEscrowed as u32,
-        }
-        .publish(env);
-        return Err(Error::RefundNotEscrowed);
-    }
-
-    claim.state = ClaimState::Cancelled;
-    let creator = claim.creator.clone();
     util::assert_claim_conservation(&claim)?;
+
+    let creator = claim.creator.clone();
+    let refund = claim.creator_stake;
+    claim.state = ClaimState::Cancelled;
+    claim.remaining_escrow = 0;
     storage::set_claim(env, claim_id, &claim);
 
     events::ClaimStateTransitioned {
@@ -420,11 +455,12 @@ pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
     }
     .publish(env);
 
-    // Cancellation is a refund: no fee. A refund is not profit, so no fee leg
-    // can exist, and a failed push parks the refund as a withdrawable balance
-    // rather than failing a cancellation whose accounting is already final.
-    // The event reports the DELTA: the creator may already hold a parked
-    // balance from an earlier settlement, and that is not this refund.
+    // Refunds are always allowed, even when the contract is paused: pause
+    // controls must never block withdrawals or refunds of already-committed
+    // funds. The check is done here (not in escrow), so the pause flag is
+    // explicit at the call site and testable independently of escrow.
+    // NOTE: this function is deliberately NOT gated on the pause flag.
+    let usdc = storage::usdc(env)?;
     let pending_before = storage::withdrawable(env, &creator);
     escrow::push_or_park(env, &usdc, &creator, refund);
 

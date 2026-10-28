@@ -1,6 +1,6 @@
-import { Pool, neonConfig, type PoolConfig } from "@neondatabase/serverless";
-import ws from "ws";
+import { Pool, type PoolConfig } from "@neondatabase/serverless";
 
+import type { RateLimitStore } from "@/lib/api/rate-limit";
 import type { ChallengeOpportunity } from "@/lib/claimDrafts";
 import type { ClaimChallenger, ClaimData } from "@/lib/contract";
 import type { AgentApiKeyRecord } from "@/lib/agents/api-keys";
@@ -29,13 +29,6 @@ import type { CopyAuditRecord, CopyPermission } from "@/lib/copy-trading";
  * `.toLowerCase()` on a hash is a no-op that matches reality, so it stays: it
  * keeps a hash arriving from a differently-cased source comparable.
  */
-
-// Neon's @neondatabase/serverless uses WebSockets in Node — wire up the ws
-// implementation. In edge/serverless runtimes that don't ship a global
-// WebSocket, this is a no-op fallback (Vercel edge has its own native WS).
-if (typeof globalThis.WebSocket === "undefined") {
-  neonConfig.webSocketConstructor = ws as unknown as typeof WebSocket;
-}
 
 export interface ClaimRow {
   id: number;
@@ -128,7 +121,7 @@ const PRIVATE_CONTENT_FIELDS = [
   "settlement_rule",
 ] as const;
 
-interface SqlStatement {
+export interface SqlStatement {
   sql:   string;
   args?: ReadonlyArray<unknown>;
 }
@@ -137,7 +130,7 @@ interface SqlStatement {
  * Postgres schema. BIGINT for any value that could exceed 2^31 (stakes, deadlines).
  * On-conflict syntax is identical to SQLite since Postgres 9.5.
  */
-const SCHEMA_STATEMENTS: SqlStatement[] = [
+export const SCHEMA_STATEMENTS: SqlStatement[] = [
   { sql: `CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_id TEXT PRIMARY KEY,
     schema_version SMALLINT NOT NULL UNIQUE,
@@ -182,6 +175,9 @@ const SCHEMA_STATEMENTS: SqlStatement[] = [
   { sql: "CREATE INDEX IF NOT EXISTS idx_claims_parent ON claims(parent_id)" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_claims_visibility ON claims(visibility)" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_claims_active ON claims(state, is_final)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_claims_visibility_state ON claims(visibility, state)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_claims_visibility_category ON claims(visibility, category)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_claims_visibility_creator ON claims(visibility, creator)" },
   { sql: `CREATE TABLE IF NOT EXISTS challengers (
     claim_id BIGINT NOT NULL,
     address TEXT NOT NULL,
@@ -310,6 +306,20 @@ const SCHEMA_STATEMENTS: SqlStatement[] = [
   // (the envelope skew window has long since closed) and should be pruned.
   { sql: "ALTER TABLE agent_api_nonces ADD COLUMN IF NOT EXISTS expires_at BIGINT NOT NULL DEFAULT 0" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_agent_api_nonces_expires ON agent_api_nonces(expires_at)" },
+  // Shared rate-limit buckets. One row per (dimension, key, window); the window
+  // is part of the primary key so a new window starts from zero without a
+  // delete. `expires_at` is epoch ms and rows past it are pruned by
+  // pruneExpiredRateLimits(). The atomic upsert in consumeRateLimit() is what
+  // makes the count hold across instances.
+  { sql: `CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+    dimension TEXT NOT NULL,
+    bucket_key TEXT NOT NULL,
+    window_start BIGINT NOT NULL,
+    count BIGINT NOT NULL DEFAULT 0,
+    expires_at BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (dimension, bucket_key, window_start)
+  )` },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_rate_limit_buckets_expires ON rate_limit_buckets(expires_at)" },
   { sql: `CREATE TABLE IF NOT EXISTS agent_api_keys (
     key_id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL,
@@ -756,13 +766,13 @@ function getDbConnectionString(): string {
   return url;
 }
 
-function buildPool(): Pool {
+export function buildPool(): Pool {
   const cfg: PoolConfig = { connectionString: getDbConnectionString() };
   return new Pool(cfg);
 }
 
 /** Convert `?` placeholders to Postgres `$1, $2, ...` in source order. */
-function toPg(sql: string): string {
+export function toPg(sql: string): string {
   let i = 0;
   return sql.replace(/\?/g, () => `$${++i}`);
 }
@@ -777,7 +787,7 @@ async function execute(
   return { rows: result.rows as Array<Record<string, unknown>>, rowCount: result.rowCount ?? 0 };
 }
 
-async function ensureSchema(pool: Pool): Promise<void> {
+export async function ensureSchema(pool: Pool): Promise<void> {
   for (const stmt of SCHEMA_STATEMENTS) {
     await execute(pool, stmt);
   }
@@ -801,20 +811,20 @@ async function batchWrite(pool: Pool, statements: SqlStatement[]): Promise<void>
   }
 }
 
-function getNumber(value: unknown): number {
+export function getNumber(value: unknown): number {
   if (typeof value === "number") return value;
   if (typeof value === "bigint") return Number(value);
   if (typeof value === "string" && value.length > 0) return Number(value);
   return 0;
 }
 
-function getString(value: unknown): string {
+export function getString(value: unknown): string {
   if (typeof value === "string") return value;
   if (value == null) return "";
   return String(value);
 }
 
-function getNullableString(value: unknown): string | null {
+export function getNullableString(value: unknown): string | null {
   if (value == null) return null;
   return String(value);
 }
@@ -853,7 +863,7 @@ function normalizeClaimRow(row: Record<string, unknown>): ClaimRow {
   };
 }
 
-function normalizeChallengerRow(row: Record<string, unknown>): ChallengerRow {
+export function normalizeChallengerRow(row: Record<string, unknown>): ChallengerRow {
   return {
     claim_id: getNumber(row.claim_id),
     address: getString(row.address),
@@ -862,7 +872,7 @@ function normalizeChallengerRow(row: Record<string, unknown>): ChallengerRow {
   };
 }
 
-function normalizeChallengeOpportunityRow(
+export function normalizeChallengeOpportunityRow(
   row: Record<string, unknown>
 ): ChallengeOpportunityRow {
   return {
@@ -891,7 +901,7 @@ function normalizeChallengeOpportunityRow(
   };
 }
 
-function buildIndexedClaimRecord(claim: ClaimData): IndexedClaimRecord {
+export function buildIndexedClaimRecord(claim: ClaimData): IndexedClaimRecord {
   const visibility = claim.visibility ?? (claim.is_private ? "private" : "public");
   const isPrivate = visibility === "private" || Boolean(claim.is_private);
 
@@ -941,7 +951,7 @@ function buildIndexedClaimRecord(claim: ClaimData): IndexedClaimRecord {
   };
 }
 
-function buildClaimUpsertStatement(claim: ClaimData, timestamp: number): SqlStatement {
+export function buildClaimUpsertStatement(claim: ClaimData, timestamp: number): SqlStatement {
   const record = buildIndexedClaimRecord(claim);
   return {
     sql: `INSERT INTO claims (
@@ -1018,7 +1028,7 @@ function buildClaimUpsertStatement(claim: ClaimData, timestamp: number): SqlStat
   };
 }
 
-function makeListPlaceholders(values: unknown[]): string {
+export function makeListPlaceholders(values: unknown[]): string {
   return values.map(() => "?").join(", ");
 }
 
@@ -1280,7 +1290,7 @@ export async function setSyncMeta(key: string, value: string): Promise<void> {
   });
 }
 
-function buildChallengeOpportunityInsertStatement(args: {
+export function buildChallengeOpportunityInsertStatement(args: {
   locale: string;
   opportunity: ChallengeOpportunity;
   generatedAt: number;
@@ -1471,7 +1481,7 @@ export interface MarketRevenueSummary {
 }
 
 /** NUMERIC(78,0) comes back as a string from pg — parse it, never via Number(). */
-function getBigInt(value: unknown): bigint {
+export function getBigInt(value: unknown): bigint {
   if (typeof value === "bigint") return value;
   if (typeof value === "number") return BigInt(Math.trunc(value));
   if (typeof value === "string" && value.trim().length > 0) return BigInt(value.trim());
@@ -1761,6 +1771,29 @@ export async function upsertAgentRecord(agent: AgentRecord): Promise<void> {
       args: [agent.agentId, capability, agent.updatedAt],
     });
   }
+}
+
+/**
+ * Store an observational reputation recomputation.
+ *
+ * Deliberately its own statement rather than a reuse of `upsertAgentRecord`:
+ * the sync worker refreshes reputation for every agent on every pass, and a
+ * full-row upsert would rewrite limits, status and capabilities from a stale
+ * in-memory copy just to move one display column. Reputation is observational —
+ * this UPDATE is the only writer, and it touches nothing an authorization path
+ * reads.
+ */
+export async function updateAgentReputationBps(
+  agentId: string,
+  reputationBps: number,
+  at: number,
+): Promise<void> {
+  const pool = await getDb();
+  await execute(pool, {
+    sql: `UPDATE agent_registry SET reputation_bps = ?, updated_at = ?
+      WHERE agent_id = ?`,
+    args: [reputationBps, at, agentId],
+  });
 }
 
 export async function getAgentRecord(agentId: string): Promise<AgentRecord | null> {
@@ -2159,7 +2192,7 @@ export interface ReasoningEventRow {
   tombstone_reason: string | null;
 }
 
-function normalizeReasoningRow(row: Record<string, unknown>): ReasoningEventRow {
+export function normalizeReasoningRow(row: Record<string, unknown>): ReasoningEventRow {
   return {
     event_id: getString(row.event_id),
     schema_version: getNumber(row.schema_version),
@@ -2299,7 +2332,7 @@ export async function insertAgentApiKey(record: AgentApiKeyRecord): Promise<void
   });
 }
 
-function toApiKeyRecord(row: Record<string, unknown>): AgentApiKeyRecord {
+export function toApiKeyRecord(row: Record<string, unknown>): AgentApiKeyRecord {
   return {
     keyId: getString(row.key_id),
     agentId: getString(row.agent_id),
@@ -2405,7 +2438,7 @@ export async function upsertSpendPermission(record: SpendPermissionRecord): Prom
   });
 }
 
-function toSpendPermission(row: Record<string, unknown>): SpendPermissionRecord {
+export function toSpendPermission(row: Record<string, unknown>): SpendPermissionRecord {
   return {
     permissionHash: getString(row.permission_hash),
     agentId: getString(row.agent_id),
@@ -2571,27 +2604,17 @@ export async function getAgentTradeRows(address: string): Promise<AgentTradeRow[
   return rows;
 }
 
-/** Registry listing for the agents page. Revoked agents are shown, not hidden. */
-export async function listAgentRecords(limit = 100): Promise<AgentRecord[]> {
-  const pool = await getDb();
-  const [records, capabilities] = await Promise.all([
-    execute(pool, {
-      sql: "SELECT * FROM agent_registry ORDER BY created_at ASC LIMIT ?",
-      args: [limit],
-    }),
-    execute(pool, {
-      sql: "SELECT agent_id, capability FROM agent_capabilities WHERE revoked_at IS NULL",
-    }),
-  ]);
-
+function mapAgentRecords(
+  recordRows: unknown[], capabilityRows: unknown[],
+): AgentRecord[] {
   const byAgent = new Map<string, string[]>();
-  for (const raw of capabilities.rows) {
+  for (const raw of capabilityRows) {
     const row = raw as Record<string, unknown>;
     const id = getString(row.agent_id);
     byAgent.set(id, [...(byAgent.get(id) ?? []), getString(row.capability)]);
   }
 
-  return records.rows.map((raw) => {
+  return recordRows.map((raw) => {
     const row = raw as Record<string, unknown>;
     const agentId = getString(row.agent_id);
     let limits: AgentRecord["limits"];
@@ -2620,6 +2643,39 @@ export async function listAgentRecords(limit = 100): Promise<AgentRecord[]> {
   });
 }
 
+/** Registry listing for the agents page. Revoked agents are shown, not hidden. */
+export async function listAgentRecords(limit = 100): Promise<AgentRecord[]> {
+  const pool = await getDb();
+  const [records, capabilities] = await Promise.all([
+    execute(pool, {
+      sql: "SELECT * FROM agent_registry ORDER BY created_at ASC LIMIT ?",
+      args: [limit],
+    }),
+    execute(pool, {
+      sql: "SELECT agent_id, capability FROM agent_capabilities WHERE revoked_at IS NULL",
+    }),
+  ]);
+  return mapAgentRecords(records.rows, capabilities.rows);
+}
+
+/** Registry agents owned by this exact, case-sensitive Stellar address. */
+export async function listAgentRecordsByOwner(ownerWallet: string): Promise<AgentRecord[]> {
+  const pool = await getDb();
+  const records = await execute(pool, {
+    sql: "SELECT * FROM agent_registry WHERE owner_wallet = ? ORDER BY created_at ASC",
+    args: [ownerWallet],
+  });
+  if (records.rows.length === 0) return [];
+
+  const capabilities = await execute(pool, {
+    sql: `SELECT ac.agent_id, ac.capability FROM agent_capabilities ac
+      JOIN agent_registry ar ON ar.agent_id = ac.agent_id
+      WHERE ar.owner_wallet = ? AND ac.revoked_at IS NULL`,
+    args: [ownerWallet],
+  });
+  return mapAgentRecords(records.rows, capabilities.rows);
+}
+
 // ── User-created baskets ──────────────────────────────────────────────────────
 
 export interface StoredBasket {
@@ -2643,7 +2699,7 @@ export async function insertBasket(basket: StoredBasket): Promise<void> {
   });
 }
 
-function toBasket(row: Record<string, unknown>): StoredBasket {
+export function toBasket(row: Record<string, unknown>): StoredBasket {
   return {
     basketId: getString(row.basket_id),
     creatorWallet: getString(row.creator_wallet),
@@ -2824,78 +2880,3 @@ export async function getBasketTransferHistory(basketId: string): Promise<Basket
     };
   });
 }
-
-// ── Agent Webhooks ────────────────────────────────────────────────────────────
-
-function toAgentWebhookRecord(row: Record<string, unknown>): AgentWebhookRecord {
-  let events: WebhookEventType[] = ["claim.created", "claim.challenged", "claim.resolved"];
-  try {
-    const parsed = JSON.parse(getString(row.events_json) || "[]");
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      events = parsed.map(String) as WebhookEventType[];
-    }
-  } catch {
-    // Keep default events on malformed JSON.
-  }
-  return {
-    webhookId: getString(row.webhook_id),
-    agentId: getString(row.agent_id),
-    url: getString(row.url),
-    secret: getString(row.secret),
-    secretPrefix: getString(row.secret_prefix),
-    events,
-    active: getNumber(row.active) === 1 && row.revoked_at == null,
-    createdAt: getNumber(row.created_at),
-    updatedAt: getNumber(row.updated_at),
-    revokedAt: row.revoked_at == null ? undefined : getNumber(row.revoked_at),
-  };
-}
-
-export async function upsertAgentWebhook(record: AgentWebhookRecord): Promise<void> {
-  const pool = await getDb();
-  await execute(pool, {
-    sql: `INSERT INTO agent_webhooks (
-      webhook_id, agent_id, url, secret, secret_prefix, events_json, active, created_at, updated_at, revoked_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(agent_id) DO UPDATE SET
-      webhook_id = excluded.webhook_id,
-      url = excluded.url,
-      secret = excluded.secret,
-      secret_prefix = excluded.secret_prefix,
-      events_json = excluded.events_json,
-      active = excluded.active,
-      updated_at = excluded.updated_at,
-      revoked_at = excluded.revoked_at`,
-    args: [
-      record.webhookId,
-      record.agentId,
-      record.url,
-      record.secret,
-      record.secretPrefix,
-      JSON.stringify(record.events),
-      record.active ? 1 : 0,
-      record.createdAt,
-      record.updatedAt,
-      record.revokedAt ?? null,
-    ],
-  });
-}
-
-export async function getAgentWebhookByAgentId(agentId: string): Promise<AgentWebhookRecord | null> {
-  const pool = await getDb();
-  const result = await execute(pool, {
-    sql: "SELECT * FROM agent_webhooks WHERE agent_id = ? LIMIT 1",
-    args: [agentId],
-  });
-  const row = result.rows[0];
-  return row ? toAgentWebhookRecord(row as Record<string, unknown>) : null;
-}
-
-export async function listActiveAgentWebhooks(): Promise<AgentWebhookRecord[]> {
-  const pool = await getDb();
-  const result = await execute(pool, {
-    sql: "SELECT * FROM agent_webhooks WHERE active = 1 AND revoked_at IS NULL ORDER BY created_at ASC",
-  });
-  return result.rows.map((row) => toAgentWebhookRecord(row as Record<string, unknown>));
-}
-

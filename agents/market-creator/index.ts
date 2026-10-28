@@ -1,4 +1,12 @@
 /**
+ * Dedupe helpers for the market-creator worker.
+ *
+ * Extracted from index.ts so they can be unit-tested offline. Behaviour is
+ * unchanged: the worker imports these and the tests pin the normalization and
+ * filtering rules.
+ */
+
+/**
  * Mimir Market Creator Agent
  *
  * Autonomously creates prediction markets from trusted public sources:
@@ -26,9 +34,11 @@
  *      MAX_CLAIMS_PER_RUN=5      (max new claims per run, default 5)
  *      MAX_ACTIVE_CLAIMS=30      (skip run if joinable on-chain claims >= this)
  *      RUN_INTERVAL_HOURS=6      (hours between runs, default 6h)
+ *      MARKET_CREATOR_POLL_JITTER_MS=2160000 (± spread per run, default 10%)
  *      MARKET_CREATOR_MAX_PER_CATEGORY_MARKETS=5      (open markets per category)
  *      MARKET_CREATOR_MAX_PER_CATEGORY_EXPOSURE_USDC=100 (open USDC per category)
  *      MARKET_CREATOR_CATEGORY_CAPS={"crypto":{"maxMarkets":3,"maxExposureUsdc":40}}
+ *      MARKET_CREATOR_DRY_RUN=1    (full pipeline, log would-be creates, no txs, no x402)
  */
 
 // Worker-scoped Gemini key. Falls back to the shared GEMINI_API_KEY when
@@ -40,11 +50,16 @@ import { requireEnv, requireAnyLLMKey, applyWorkerGeminiKey } from "../../lib/ag
 import { callLLM, activeLLMProvider, activeLLMModel, activeLLMKeyFingerprint, pickGeminiModel, extractJson } from "../../lib/llm";
 import { INJECTION_GUARD, fenceUntrusted } from "../../lib/prompt-safety";
 import { fetchLaunchEvents, fetchWeatherEvents, type LaunchEvent, type WeatherEvent } from "./sources";
+import { fetchCryptoEvents, fetchSportsEvents, fetchStockEvents, type CryptoEvent, type SportEvent, type StockEvent } from "./sources";
+import { extractUsdThresholds, cryptoThresholdReason, formatUsd } from "./thresholds";
+import { filterDuplicateCandidates, buildCandidateSignature, normalizeComparableText, normalizeResolutionUrl, type ExistingClaimSignature } from "./dedupe";
+import { draftClaimCandidates } from "./drafting";
 import {
   cancelClaim,
   createClaim as createClaimOnChain,
   getClaimCount,
   readClaimRaw,
+  type CreateClaimParams,
 } from "../../lib/contract";
 import { getCreatorWallet, readAgentBalances } from "../../lib/agent-wallets";
 import { sha256Hex } from "../../lib/content-hash";
@@ -55,7 +70,8 @@ import {
   requireMarketContractId,
 } from "../../lib/stellar";
 import { payingWalletFor } from "../../lib/x402/buyer";
-import { reportingPoll } from "../../lib/ops/heartbeat";
+import { reportingPoll, runWorkerLoop } from "../../lib/ops/heartbeat";
+import { resolvePollJitterMs } from "../../lib/ops/poll-jitter";
 import { isCategoryEnabled } from "../../lib/ops/flags";
 import { unitsToUsdc } from "../../lib/usdc";
 import { gatherCouncilPreflight } from "./council-preflight";
@@ -79,11 +95,16 @@ import {
   summariseCreatorCaps,
 } from "../../lib/market-creator/category-caps";
 import {
+  creatorSideEffectPolicy,
+  isMarketCreatorDryRun,
+} from "../../lib/market-creator/dry-run";
+import {
   BackoffError,
   CREATOR_BACKOFF,
   describeBackoffError,
   withBackoff,
 } from "../../lib/ops/backoff-policies";
+import { reconcileSettlements } from "../../lib/server/settlement-index";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONTRACT_ID         = requireMarketContractId();
@@ -93,6 +114,9 @@ const CREATOR_STAKE_USDC = Number(
 const MAX_CLAIMS_PER_RUN  = Number(process.env.MAX_CLAIMS_PER_RUN ?? "5");
 const MAX_ACTIVE_CLAIMS   = Number(process.env.MAX_ACTIVE_CLAIMS ?? "30");
 const RUN_INTERVAL_HOURS  = Number(process.env.RUN_INTERVAL_HOURS ?? "6");
+const RUN_INTERVAL_MS     = RUN_INTERVAL_HOURS * 3600 * 1000;
+// ± around each run; unset = 10% of the interval, 0 = fixed scheduling.
+const POLL_JITTER_MS      = resolvePollJitterMs(RUN_INTERVAL_MS, process.env.MARKET_CREATOR_POLL_JITTER_MS);
 // Creator open-exposure ceiling (USDC). Parsed explicitly so a bad env value
 // fails closed instead of disabling the funded-state safety rail.
 const _exposurePolicy = parseExposureCapPolicy(process.env);
@@ -120,9 +144,50 @@ const MIN_QUALITY_SCORE   = 70; // 0-100
 // Proposal-only until shadow precision has been measured against human review.
 // Opt-in rather than opt-out: the default has to be the safe one.
 const SHADOW_MODE         = process.env.MARKET_CREATOR_AUTONOMOUS !== "1";
-const DEFAULT_MAX_CHALLENGERS = Number(process.env.MARKET_CREATOR_MAX_CHALLENGERS ?? "10");
 /** U+001F, so a proposal id cannot be forged by a question containing the joiner. */
 const UNIT_SEPARATOR = String.fromCharCode(0x1f);
+
+/**
+ * Upper bound for `max_challengers`, mirroring the contract's `MAX_CHALLENGERS`.
+ * The on-chain `create_claim` rejects anything above it, so a value past this
+ * would fail every create at runtime instead of at boot.
+ */
+export const CONTRACT_MAX_CHALLENGERS = 100;
+
+/**
+ * Parse `MARKET_CREATOR_MAX_CHALLENGERS` into a usable challenger cap.
+ *
+ * Exported so the boot-time validation can be unit tested without spinning up
+ * the worker. A malformed value must fail closed: silently falling back to the
+ * default would let a typo'd cap diverge from what the proposal queue records.
+ */
+export function parseMaxChallengers(
+  raw: string | undefined,
+): { ok: true; value: number } | { ok: false; error: string } {
+  const trimmed = (raw ?? "").trim();
+  const source = trimmed === "" ? "10" : trimmed;
+  const value = Number(source);
+  if (!Number.isInteger(value)) {
+    return {
+      ok: false,
+      error: `MARKET_CREATOR_MAX_CHALLENGERS must be an integer, got "${raw}"`,
+    };
+  }
+  if (value < 1 || value > CONTRACT_MAX_CHALLENGERS) {
+    return {
+      ok: false,
+      error:
+        `MARKET_CREATOR_MAX_CHALLENGERS must be between 1 and ` +
+        `${CONTRACT_MAX_CHALLENGERS} (contract MAX_CHALLENGERS), got ${value}`,
+    };
+  }
+  return { ok: true, value };
+}
+
+const _maxChallengers = parseMaxChallengers(process.env.MARKET_CREATOR_MAX_CHALLENGERS);
+if (!_maxChallengers.ok) {
+  throw new Error(`[market-creator] ${_maxChallengers.error}`);
+}
 const CRYPTO_MIN_THRESHOLD_RATIO = Number(process.env.CRYPTO_MIN_THRESHOLD_RATIO ?? "0.65");
 const CRYPTO_MAX_THRESHOLD_RATIO = Number(process.env.CRYPTO_MAX_THRESHOLD_RATIO ?? "1.35");
 const CREATE_DELAY_MS = Number(process.env.MARKET_CREATE_DELAY_MS ?? "600000");
@@ -172,49 +237,6 @@ const CREATOR_ADDR   = CREATOR.address;
 const CREATOR_PAYER  = payingWalletFor(CREATOR);
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-interface ClaimCandidate {
-  question:         string;
-  creatorPosition:  string;
-  counterPosition:  string;
-  resolutionUrl:    string;
-  category:         string;
-  marketType:       string;
-  settlementRule:   string;
-  deadlineHours:    number;
-  qualityScore:     number;
-  sourceType:       string;
-}
-
-interface ExistingClaimSignature {
-  id:               number;
-  category:         string;
-  questionKey:      string;
-  resolutionUrlKey: string;
-}
-
-interface SportEvent {
-  id:            string;
-  name:          string;
-  startDate:     string;  // ISO 8601
-  startMs:       number;  // epoch ms (NaN if unparseable)
-  resolutionUrl: string;
-  status:        string;
-}
-
-interface CryptoEvent {
-  id:            string;  // coingecko slug (e.g. "bitcoin")
-  name:          string;
-  symbol:        string;
-  resolutionUrl: string;
-  priceUsd:      number;
-}
-
-interface StockEvent {
-  symbol:        string;  // ticker (e.g. "AAPL")
-  name:          string;
-  resolutionUrl: string;  // stockanalysis.com page (oracle scrapes price/day change)
-}
-
 function formatUsd(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "unknown";
   if (value >= 1000) return value.toLocaleString("en-US", { maximumFractionDigits: 0 });
@@ -222,7 +244,7 @@ function formatUsd(value: number): string {
   return value.toLocaleString("en-US", { maximumFractionDigits: 4 });
 }
 
-function extractUsdThresholds(text: string): number[] {
+export function extractUsdThresholds(text: string): number[] {
   const thresholds: number[] = [];
   const seen = new Set<string>();
   const patterns = [
@@ -253,7 +275,7 @@ function extractUsdThresholds(text: string): number[] {
   return thresholds;
 }
 
-function cryptoThresholdReason(candidate: ClaimCandidate, event: CryptoEvent): string | null {
+export function cryptoThresholdReason(candidate: ClaimCandidate, event: CryptoEvent): string | null {
   if (!Number.isFinite(event.priceUsd) || event.priceUsd <= 0) {
     return `missing live CoinGecko price for ${event.symbol}`;
   }
@@ -278,83 +300,14 @@ function cryptoThresholdReason(candidate: ClaimCandidate, event: CryptoEvent): s
 
 // ── Source fetchers ───────────────────────────────────────────────────────────
 
-function normalizeComparableText(value: string): string {
-  return value
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\b(will|does|do|did|the|their|a|an|in|on|at|by|before|after|during)\b/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeResolutionUrl(value: string): string {
-  try {
-    const url = new URL(value.trim());
-    url.hash = "";
-    url.search = "";
-    return url.toString().replace(/\/$/, "").toLowerCase();
-  } catch {
-    return value.trim().replace(/\/$/, "").toLowerCase();
-  }
-}
-
-function buildCandidateSignature(candidate: ClaimCandidate): ExistingClaimSignature {
-  return {
-    id:               0,
-    category:         String(candidate.category ?? "").toLowerCase().trim(),
-    questionKey:      normalizeComparableText(String(candidate.question ?? "")),
-    resolutionUrlKey: normalizeResolutionUrl(String(candidate.resolutionUrl ?? "")),
-  };
-}
-
-function filterDuplicateCandidates(
-  candidates: ClaimCandidate[],
-  existingClaims: ExistingClaimSignature[],
-): ClaimCandidate[] {
-  const existingQuestionKeys = new Map<string, number>();
-  const existingSourceKeys = new Map<string, number>();
-
-  for (const claim of existingClaims ?? []) {
-    if (claim.questionKey) existingQuestionKeys.set(`${claim.category}:${claim.questionKey}`, claim.id);
-    if (claim.resolutionUrlKey) existingSourceKeys.set(`${claim.category}:${claim.resolutionUrlKey}`, claim.id);
-  }
-
-  const seenQuestionKeys = new Set<string>();
-  const seenSourceKeys = new Set<string>();
-
-  return candidates.filter((candidate) => {
-    const sig = buildCandidateSignature(candidate ?? {} as ClaimCandidate);
-    const questionKey = `${sig.category}:${sig.questionKey}`;
-    const sourceKey = `${sig.category}:${sig.resolutionUrlKey}`;
-
-    const existingSourceId = sig.resolutionUrlKey ? existingSourceKeys.get(sourceKey) : undefined;
-    if (existingSourceId !== undefined) {
-      console.warn(`[market-creator] Drop duplicate candidate - same source as active claim #${existingSourceId}: ${candidate.question.slice(0, 90)}`);
-      return false;
-    }
-
-    const existingQuestionId = sig.questionKey ? existingQuestionKeys.get(questionKey) : undefined;
-    if (existingQuestionId !== undefined) {
-      console.warn(`[market-creator] Drop duplicate candidate - same question as active claim #${existingQuestionId}: ${candidate.question.slice(0, 90)}`);
-      return false;
-    }
-
-    if ((sig.resolutionUrlKey && seenSourceKeys.has(sourceKey)) || (sig.questionKey && seenQuestionKeys.has(questionKey))) {
-      console.warn(`[market-creator] Drop duplicate candidate within run: ${candidate.question.slice(0, 90)}`);
-      return false;
-    }
-
-    if (sig.resolutionUrlKey) seenSourceKeys.add(sourceKey);
-    if (sig.questionKey) seenQuestionKeys.add(questionKey);
-    return true;
-  });
-}
-
 async function applyCouncilPreflight(candidates: ClaimCandidate[]): Promise<ClaimCandidate[]> {
   if (!PREFLIGHT_ENABLED || candidates.length === 0) {
+    return candidates;
+  }
+  if (!SIDE_EFFECTS.paidPreflight) {
+    console.log(
+      `[market-creator] DRY_RUN — skipping paid council preflight for ${candidates.length} candidate(s).`,
+    );
     return candidates;
   }
 
@@ -473,7 +426,6 @@ async function fetchCryptoEvents(): Promise<{ text: string; events: CryptoEvent[
 // sport/league. Live games make deadline math uncertain and finished games
 // resolve immediately — both are dead inventory, so we keep only `pre` state.
 const SPORTS_POST_GAME_BUFFER_MS = 4 * 3600 * 1000;
-const MAX_DEADLINE_HOURS = 72;
 
 async function fetchEspnScoreboard(
   url: string,
@@ -813,6 +765,28 @@ async function createClaim(candidate: ClaimCandidate): Promise<string | null> {
   // fractional deadlineHours, and the contract takes whole seconds.
   const deadline = Math.floor(Date.now() / 1000 + candidate.deadlineHours * 3600);
 
+  const params: CreateClaimParams = {
+    question:              candidate.question,
+    creator_position:      candidate.creatorPosition,
+    counter_position:      candidate.counterPosition,
+    resolution_url:        candidate.resolutionUrl,
+    deadline,
+    stake_amount:          CREATOR_STAKE_USDC,
+    category:              candidate.category,
+    market_type:           candidate.marketType,
+    odds_mode:             "pool",
+    settlement_rule:       candidate.settlementRule,
+    max_challengers:       100,
+    visibility:            "public",
+    agent_owner_recipient: FEE_RECIPIENT,
+  };
+
+  if (!SIDE_EFFECTS.createClaim) {
+    console.log(`[market-creator] DRY_RUN — would call create_claim with:`);
+    console.log(`[market-creator] ${JSON.stringify(params)}`);
+    return "(dry-run)";
+  }
+
   // Check the USDC bankroll. Fees are XLM and separate, so staking cannot strand
   // the creator for fees.
   const balances = await readAgentBalances(CREATOR_ADDR);
@@ -839,7 +813,7 @@ async function createClaim(candidate: ClaimCandidate): Promise<string | null> {
       market_type:           candidate.marketType,
       odds_mode:             "pool",
       settlement_rule:       candidate.settlementRule,
-      max_challengers:       100,
+      max_challengers:       DEFAULT_MAX_CHALLENGERS,
       visibility:            "public",
       agent_owner_recipient: FEE_RECIPIENT,
     }), { policy: CREATOR_BACKOFF });
@@ -945,6 +919,13 @@ async function sweepAndCount(): Promise<{ cancelled: number; joinable: number; j
     if (claim.creator !== CREATOR_ADDR) continue;
     if (claim.state !== "open") continue;
     if (claim.deadline > now) continue;
+
+    if (!SIDE_EFFECTS.cancelClaim) {
+      console.log(
+        `[market-creator] DRY_RUN — would cancel stale claim #${id} (expired, no challenger)`,
+      );
+      continue;
+    }
 
     console.log(`[market-creator] Cancelling stale claim #${id} (expired, no challenger)`);
     try {
@@ -1258,7 +1239,8 @@ async function run(): Promise<void> {
         `Set MARKET_CREATOR_AUTONOMOUS=1 once review precision has been measured.`,
     );
   } else {
-    console.log(`\n[market-creator] Created ${created}/${approvedCandidates.length} approved markets this run.`);
+    const verb = DRY_RUN ? "Would create" : "Created";
+    console.log(`\n[market-creator] ${verb} ${created}/${approvedCandidates.length} approved markets this run.`);
   }
 }
 
@@ -1284,12 +1266,15 @@ async function main(): Promise<void> {
   console.log(`  Stake/mkt  : ${CREATOR_STAKE_USDC} USDC`);
   console.log(`  Max/run    : ${MAX_CLAIMS_PER_RUN} claims`);
   console.log(`  Active cap : ${MAX_ACTIVE_CLAIMS} unresolved (skip run above this)`);
+  console.log(`  Challengers: ${DEFAULT_MAX_CHALLENGERS} per market (contract max ${CONTRACT_MAX_CHALLENGERS})`);
   console.log(`  Exposure   : ${MAX_OPEN_EXPOSURE_USDC} USDC open-creator ceiling`);
   console.log(`  Cat caps   : ${describeCategoryCapPolicy(CREATOR_POLICY.categoryCaps)}`);
   console.log(`  Preflight  : ${PREFLIGHT_ENABLED ? `on via ${PREFLIGHT_BASE_URL}` : "off"}`);
+  console.log(`  Dry run    : ${DRY_RUN ? "on — no transactions, no x402 payments" : "off"}`);
   console.log(`  Create gap : ${CREATE_DELAY_MS / 1000}s`);
   console.log(`  Cancel gap : ${CANCEL_DELAY_MS / 1000}s`);
   console.log(`  Interval   : every ${RUN_INTERVAL_HOURS}h`);
+  console.log(`  Run jitter : ±${(POLL_JITTER_MS / 1000).toFixed(0)}s`);
   console.log("═══════════════════════════════════════════════\n");
 
   const safeRun = () =>
@@ -1297,8 +1282,12 @@ async function main(): Promise<void> {
       pause: "market_creator_worker",
     });
 
-  await safeRun();
-  setInterval(safeRun, RUN_INTERVAL_HOURS * 3600 * 1000);
+  await runWorkerLoop({
+    worker: "market_creator",
+    intervalMs: RUN_INTERVAL_MS,
+    jitterMs: POLL_JITTER_MS,
+    cycle: safeRun,
+  });
 }
 
 main().catch((err) => {

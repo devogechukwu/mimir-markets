@@ -9,9 +9,9 @@ use crate::escrow;
 use crate::resolve;
 use crate::storage;
 use crate::types::{
-    Challenger, ChallengerPage, Claim, ClaimFeeView, CreateParams, Error, FeePolicy, MarketConfig,
-    PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict, WinnerSide,
-    MAX_BATCH_SIZE,
+    Challenger, ChallengerPage, Claim, ClaimFeeView, CreateParams, Error, FeePolicy,
+    MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict,
+    WinnerSide, MAX_BATCH_SIZE,
 };
 
 #[contract]
@@ -159,6 +159,13 @@ impl MimirMarket {
 
     /// Solidity used `msg.sender`; Soroban has no equivalent for a top-level
     /// call, so the beneficiary is an explicit argument that must authorize.
+    ///
+    /// Withdrawals are intentionally NOT gated by the pause flag: pause
+    /// controls may halt new claims, challenges, and resolutions, but must
+    /// never block a funded user from pulling their own balance. This keeps
+    /// contract-first accounting intact — a paused market still owes its
+    /// users their escrowed funds, and the only safe way to honor that is to
+    /// let them withdraw.
     pub fn withdraw(env: Env, who: Address) -> Result<i128, Error> {
         resolve::withdraw(&env, who)
     }
@@ -173,6 +180,28 @@ impl MimirMarket {
         storage::get_claim(&env, claim_id)
     }
 
+    /// Paginated list of claim ids created by `creator`, in creation order.
+    ///
+    /// Returns up to `limit` ids starting at `offset` (0-based) together with
+    /// the creator's total claim count, so callers can detect the last page
+    /// without an extra empty fetch. An `offset` beyond the end of the index
+    /// returns an empty `Vec` with `total` set correctly.
+    ///
+    /// The per-creator index is appended in `create_claim` and stored as
+    /// bounded pages of ids, so this read costs O(limit) rather than
+    /// O(total claims). TTL is extended on read like other persistent views.
+    pub fn get_creator_claims(
+        env: Env,
+        creator: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Result<(Vec<u64>, u32), Error> {
+        if !storage::is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+        Ok(storage::creator_claims_page(&env, &creator, offset, limit))
+    }
+
     /// The claim's verdict with its explicit encoding version.
     ///
     /// Refuses with `Error::UnsupportedVerdictVersion` if the stored verdict was
@@ -185,6 +214,13 @@ impl MimirMarket {
     /// Convenience view returning only the decoded verdict side.
     pub fn get_verdict_side(env: Env, claim_id: u64) -> Result<WinnerSide, Error> {
         resolve::get_verdict(&env, claim_id)?.decode()
+    }
+
+    /// Whether the contract is currently paused. Pause halts new claims,
+    /// challenges, and resolutions, but never blocks `withdraw` or
+    /// `claim_fees` — see those entry points for the invariant.
+    pub fn is_paused(env: Env) -> bool {
+        storage::is_paused(&env)
     }
 
     /// Batch-read up to [`MAX_BATCH_SIZE`] claims in one simulated call.

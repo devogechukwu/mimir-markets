@@ -52,13 +52,20 @@ function makeDeps(opts: {
   };
 }
 
-const BASKET = {
-  id: "b",
-  name: "Basket",
-  members: [{ agentId: "a1", weightBps: 10_000 }],
-};
+// ---------------------------------------------------------------------------
+// Clock control
+// ---------------------------------------------------------------------------
 
-const AGENT = { id: "a1", displayName: "Agent One", address: MEMBER_ADDRESS };
+function withFixedClock(fn: () => void | Promise<void>) {
+  return async () => {
+    const spy = mock.method(Date, "now", () => NOW * 1000);
+    try {
+      await fn();
+    } finally {
+      spy.mock.restore();
+    }
+  };
+}
 
 describe("pendingMirrorQueueFor & pendingMirrorsFor", () => {
   const originalDateNow = Date.now;
@@ -86,7 +93,7 @@ describe("pendingMirrorQueueFor & pendingMirrorsFor", () => {
       subscriptions: [],
       definitions: [BASKET],
       agents: [AGENT],
-      claims: [{ id: 1, deadline: NOW + 1000 }],
+      openClaims: [{ id: 1, deadline: NOW + 1000 }],
       challengers: { 1: [{ address: MEMBER_ADDRESS, stake: 10 }] },
     });
 
@@ -166,7 +173,7 @@ describe("pendingMirrorQueueFor & pendingMirrorsFor", () => {
       subscriptions: ["b"],
       definitions: [BASKET],
       agents: [AGENT],
-      claims: [
+      openClaims: [
         { id: 1, deadline: NOW + 1000 },
         { id: 2, deadline: NOW + 2000 },
       ],

@@ -37,6 +37,8 @@ import {
   buildVSCacheFreshness,
   makeContractFreshness,
   type VSCacheFreshness,
+  type ProjectionCompleteness,
+  CURRENT_PROJECTION_GENERATION,
 } from "@/lib/vs-freshness";
 import {
   getContractEvents,
@@ -70,6 +72,11 @@ export {
   isValidStellarAddress,
   validateMoneyField 
 } from "@/lib/server/sync-helpers";
+export {
+  reconcileSettlements,
+  type ReconcileSettlementsOptions,
+  type SettlementSyncResult,
+} from "@/lib/server/settlement-index";
 
 /**
  * Transactionally update a sync cursor with validation.
@@ -329,20 +336,64 @@ function getReferenceUpdatedAt(
   return mutableReference ?? anyReference ?? null;
 }
 
+export async function getProjectionCompleteness(): Promise<ProjectionCompleteness> {
+  try {
+    const [storedLedger, storedGaps, storedGeneration] = await Promise.all([
+      getSyncMeta(CLAIM_EVENTS_CURSOR_KEY).catch(() => null),
+      getSyncMeta("projection_known_gaps").catch(() => null),
+      getSyncMeta("projection_generation").catch(() => null),
+    ]);
+
+    const validatedLedger = validateCursorValue(storedLedger, CLAIM_EVENTS_CURSOR_KEY, "vs-index");
+    const trustedLedger =
+      validatedLedger !== null && validatedLedger > 0
+        ? validatedLedger
+        : isMarketConfigured()
+        ? getDeployLedger()
+        : null;
+
+    const validatedGaps = validateCursorValue(storedGaps, "projection_known_gaps", "vs-index");
+    const knownGaps = validatedGaps !== null && validatedGaps >= 0 ? validatedGaps : 0;
+
+    const validatedGen = validateCursorValue(storedGeneration, "projection_generation", "vs-index");
+    const projectionGeneration =
+      validatedGen !== null && validatedGen > 0 ? validatedGen : CURRENT_PROJECTION_GENERATION;
+
+    return {
+      trustedLedger,
+      knownGaps,
+      projectionGeneration,
+    };
+  } catch {
+    return {
+      trustedLedger: isMarketConfigured() ? getDeployLedger() : null,
+      knownGaps: 0,
+      projectionGeneration: CURRENT_PROJECTION_GENERATION,
+    };
+  }
+}
+
 async function buildListCacheFreshness(rows: ClaimRow[]) {
-  const lastSyncAt = Number((await getSyncMeta("last_sync_at")) ?? "0");
+  const [lastSyncAtRaw, projection] = await Promise.all([
+    getSyncMeta("last_sync_at"),
+    getProjectionCompleteness(),
+  ]);
+  const lastSyncAt = Number(lastSyncAtRaw ?? "0");
   return buildVSCacheFreshness({
     updatedAtMs: getReferenceUpdatedAt(rows, lastSyncAt > 0 ? lastSyncAt : null),
     freshnessWindowMs: LIST_FRESHNESS_MS,
     source: "index",
+    projection,
   });
 }
 
-function buildDetailCacheFreshness(row: ClaimRow | null) {
+async function buildDetailCacheFreshness(row: ClaimRow | null) {
+  const projection = await getProjectionCompleteness();
   return buildVSCacheFreshness({
     updatedAtMs: row?.updated_at ?? null,
     freshnessWindowMs: DETAIL_FRESHNESS_MS,
     source: "index",
+    projection,
   });
 }
 
@@ -612,12 +663,31 @@ function decodeClaimEventTopics(event: rpc.Api.EventResponse): { name: string; c
   return { name, claimId };
 }
 
+export interface ClaimEventSyncOptions {
+  onBeforeCheckpoint?: (nextCursor: number) => Promise<void> | void;
+  onAfterCheckpoint?: (nextCursor: number) => Promise<void> | void;
+  interrupt?: {
+    beforeCheckpoint?: boolean | number;
+    afterCheckpoint?: boolean | number;
+  };
+  eventsFetcher?: (
+    contractId: string,
+    opts: { startLedger: number; maxPages: number },
+  ) => Promise<{
+    events: rpc.Api.EventResponse[];
+    latestLedger: number;
+    truncated: boolean;
+  }>;
+}
+
 /**
  * Incrementally ingest claim updates from Soroban contract events.
  * Listens for ClaimCreated, ClaimChallenged, ClaimResolved, MarketSettled, ClaimCancelled.
  * Updates only the claims touched by these events and advances the persisted ledger cursor.
  */
-export async function syncClaimsFromEvents(): Promise<ClaimEventSyncResult> {
+export async function syncClaimsFromEvents(
+  options: ClaimEventSyncOptions = {},
+): Promise<ClaimEventSyncResult> {
   const empty: ClaimEventSyncResult = {
     fromLedger: 0,
     toLedger: 0,
@@ -635,7 +705,8 @@ export async function syncClaimsFromEvents(): Promise<ClaimEventSyncResult> {
   const validatedStored = validateCursorValue(stored, CLAIM_EVENTS_CURSOR_KEY, "vs-index");
   const fromLedger = validatedStored !== null && validatedStored > 0 ? validatedStored : getDeployLedger();
 
-  const scan = await getContractEvents(contractId, {
+  const fetchEvents = options.eventsFetcher ?? getContractEvents;
+  const scan = await fetchEvents(contractId, {
     startLedger: fromLedger,
     maxPages: CLAIM_EVENTS_MAX_PAGES_PER_PASS,
   });
@@ -697,7 +768,15 @@ export async function syncClaimsFromEvents(): Promise<ClaimEventSyncResult> {
   const reached = scan.events.reduce((max, event) => Math.max(max, Number(event.ledger ?? 0)), fromLedger);
   const nextCursor = scan.truncated ? reached : Math.max(reached, scan.latestLedger);
   if (nextCursor > fromLedger) {
+    if (options.interrupt?.beforeCheckpoint === true || options.interrupt?.beforeCheckpoint === nextCursor) {
+      throw new Error(`[vs-index] Crash interrupted before claim events checkpoint commit at ${nextCursor}`);
+    }
+    if (options.onBeforeCheckpoint) await options.onBeforeCheckpoint(nextCursor);
     await advanceCursor(CLAIM_EVENTS_CURSOR_KEY, nextCursor);
+    if (options.interrupt?.afterCheckpoint === true || options.interrupt?.afterCheckpoint === nextCursor) {
+      throw new Error(`[vs-index] Crash interrupted after claim events checkpoint commit at ${nextCursor}`);
+    }
+    if (options.onAfterCheckpoint) await options.onAfterCheckpoint(nextCursor);
   }
 
   return {
@@ -711,7 +790,21 @@ export async function syncClaimsFromEvents(): Promise<ClaimEventSyncResult> {
   };
 }
 
-export async function reconcileVsIndex(): Promise<ReconcileResult> {
+export interface ReconcileVsIndexOptions {
+  onBeforeCheckpoint?: (checkpoint: number) => Promise<void> | void;
+  onAfterCheckpoint?: (checkpoint: number) => Promise<void> | void;
+  interrupt?: {
+    beforeCheckpoint?: boolean | number;
+    afterCheckpoint?: boolean | number;
+  };
+  getClaimCount?: () => Promise<number>;
+  getClaimSummaries?: (startId: number, count: number) => Promise<ClaimData[]>;
+  skipEventSync?: boolean;
+}
+
+export async function reconcileVsIndex(
+  options: ReconcileVsIndexOptions = {},
+): Promise<ReconcileResult> {
   const now = Date.now();
   reconcileRunCount += 1;
 
@@ -722,22 +815,28 @@ export async function reconcileVsIndex(): Promise<ReconcileResult> {
   let inconsistencies = 0;
 
   // 1. Primary incremental ingestion: follow contract events from the persisted ledger cursor
-  try {
-    const eventSync = await syncClaimsFromEvents();
-    synced += eventSync.claimsRefreshed;
-    stateChanges += eventSync.stateChanges;
-  } catch (err) {
-    console.warn("[vs-index] Incremental event sync encountered error, continuing with fallback safety net:", err);
+  if (!options.skipEventSync) {
+    try {
+      const eventSync = await syncClaimsFromEvents();
+      synced += eventSync.claimsRefreshed;
+      stateChanges += eventSync.stateChanges;
+    } catch (err) {
+      console.warn("[vs-index] Incremental event sync encountered error, continuing with fallback safety net:", err);
+    }
   }
 
   // 2. Range reconcile as periodic safety net at lower frequency
   const shouldRunRangeSafetyNet =
-    reconcileRunCount % RANGE_RECONCILE_INTERVAL_RUNS === 1 || reconcileRunCount === 1;
+    options.getClaimCount !== undefined ||
+    reconcileRunCount % RANGE_RECONCILE_INTERVAL_RUNS === 1 ||
+    reconcileRunCount === 1;
 
   if (shouldRunRangeSafetyNet) {
+    const fetchClaimCount = options.getClaimCount ?? getClaimCount;
+    const fetchClaimSummaries = options.getClaimSummaries ?? getClaimSummaries;
     const [lastClaimCountValue, totalClaimCount, activeRows] = await Promise.all([
       getSyncMeta("last_claim_count"),
-      getClaimCount(),
+      fetchClaimCount(),
       getClaimsByFilter({
         states: ["open", "active"],
         orderBy: "id_desc",
@@ -756,7 +855,7 @@ export async function reconcileVsIndex(): Promise<ReconcileResult> {
     ) {
       const pageEnd = Math.min(startId + CLAIM_SYNC_PAGE_SIZE - 1, totalClaimCount);
       const expected = pageEnd - startId + 1;
-      const pageClaims = await getClaimSummaries(startId, expected);
+      const pageClaims = await fetchClaimSummaries(startId, expected);
       
       // Validate chain-state accounting before persisting
       for (const claim of pageClaims) {
@@ -777,12 +876,28 @@ export async function reconcileVsIndex(): Promise<ReconcileResult> {
         let checkpoint = startId - 1;
         while (got.has(checkpoint + 1)) checkpoint += 1;
         if (checkpoint >= startId) {
+          if (options.interrupt?.beforeCheckpoint === true || options.interrupt?.beforeCheckpoint === checkpoint) {
+            throw new Error(`[vs-index] Crash interrupted before checkpoint commit at ${checkpoint}`);
+          }
+          if (options.onBeforeCheckpoint) await options.onBeforeCheckpoint(checkpoint);
           await advanceCursor("last_claim_count", checkpoint);
+          if (options.interrupt?.afterCheckpoint === true || options.interrupt?.afterCheckpoint === checkpoint) {
+            throw new Error(`[vs-index] Crash interrupted after checkpoint commit at ${checkpoint}`);
+          }
+          if (options.onAfterCheckpoint) await options.onAfterCheckpoint(checkpoint);
         }
         break;
       }
 
+      if (options.interrupt?.beforeCheckpoint === true || options.interrupt?.beforeCheckpoint === pageEnd) {
+        throw new Error(`[vs-index] Crash interrupted before checkpoint commit at ${pageEnd}`);
+      }
+      if (options.onBeforeCheckpoint) await options.onBeforeCheckpoint(pageEnd);
       await advanceCursor("last_claim_count", pageEnd);
+      if (options.interrupt?.afterCheckpoint === true || options.interrupt?.afterCheckpoint === pageEnd) {
+        throw new Error(`[vs-index] Crash interrupted after checkpoint commit at ${pageEnd}`);
+      }
+      if (options.onAfterCheckpoint) await options.onAfterCheckpoint(pageEnd);
     }
 
     // 2b. Safety refresh for active claims
@@ -898,6 +1013,7 @@ export async function getVsFeedSnapshot(
       const refreshedHasMore = refreshedRows.length > limit;
       const refreshedPaginatedRows = refreshedHasMore ? refreshedRows.slice(0, limit) : refreshedRows;
       const refreshedNextCursor = refreshedHasMore ? refreshedPaginatedRows[refreshedPaginatedRows.length - 1].id : null;
+      const projection = await getProjectionCompleteness();
     
       return {
         items: refreshedPaginatedRows.map((row) => claimRowToVSData(row)),
@@ -905,6 +1021,7 @@ export async function getVsFeedSnapshot(
           updatedAtMs: Date.now(),
           freshnessWindowMs: LIST_FRESHNESS_MS,
           source: "index",
+          projection,
         }),
         nextCursor: refreshedNextCursor,
       };
@@ -937,6 +1054,11 @@ export async function getVsFeedSnapshot(
         updatedAtMs: null,
         freshnessWindowMs: LIST_FRESHNESS_MS,
         source: "index",
+        projection: {
+          trustedLedger: null,
+          knownGaps: 0,
+          projectionGeneration: CURRENT_PROJECTION_GENERATION,
+        },
       }),
     };
   }
@@ -1020,6 +1142,7 @@ export async function getVsDetailSnapshot(vsId: number): Promise<VSDetailSnapsho
             updatedAtMs: lastSyncAt > 0 ? lastSyncAt : null,
             freshnessWindowMs: LIST_FRESHNESS_MS,
             source: "index",
+            projection: await getProjectionCompleteness(),
           }),
         };
       }
@@ -1036,6 +1159,11 @@ export async function getVsDetailSnapshot(vsId: number): Promise<VSDetailSnapsho
         updatedAtMs: null,
         freshnessWindowMs: DETAIL_FRESHNESS_MS,
         source: "index",
+        projection: {
+          trustedLedger: null,
+          knownGaps: 0,
+          projectionGeneration: CURRENT_PROJECTION_GENERATION,
+        },
       }),
     };
   }
@@ -1046,6 +1174,11 @@ export async function getVsDetailSnapshot(vsId: number): Promise<VSDetailSnapsho
       updatedAtMs: null,
       freshnessWindowMs: DETAIL_FRESHNESS_MS,
       source: "index",
+      projection: {
+        trustedLedger: null,
+        knownGaps: 0,
+        projectionGeneration: CURRENT_PROJECTION_GENERATION,
+      },
     }),
   };
 }
@@ -1070,6 +1203,8 @@ export async function getUserVsSnapshot(
         ({ row }) => row.is_final === 0 && !isFresh(row.updated_at, LIST_FRESHNESS_MS)
       );
 
+    const projection = await getProjectionCompleteness();
+
     if (storedItems.length > 0 && !shouldRefresh) {
       return {
         items: storedItems,
@@ -1077,6 +1212,7 @@ export async function getUserVsSnapshot(
           updatedAtMs: getReferenceUpdatedAt(storedRows),
           freshnessWindowMs: LIST_FRESHNESS_MS,
           source: "index",
+          projection,
         }),
       };
     }
@@ -1091,6 +1227,7 @@ export async function getUserVsSnapshot(
           updatedAtMs: getReferenceUpdatedAt(storedRows),
           freshnessWindowMs: LIST_FRESHNESS_MS,
           source: "index",
+          projection,
         }),
       };
     }
@@ -1111,6 +1248,7 @@ export async function getUserVsSnapshot(
             updatedAtMs: getReferenceUpdatedAt(storedRows),
             freshnessWindowMs: LIST_FRESHNESS_MS,
             source: "index",
+            projection,
           }),
         };
       }
@@ -1122,6 +1260,7 @@ export async function getUserVsSnapshot(
         updatedAtMs: getReferenceUpdatedAt(storedRows),
         freshnessWindowMs: LIST_FRESHNESS_MS,
         source: "index",
+        projection,
       }),
     };
   } catch {
@@ -1145,6 +1284,11 @@ export async function getUserVsSnapshot(
         updatedAtMs: null,
         freshnessWindowMs: LIST_FRESHNESS_MS,
         source: "index",
+        projection: {
+          trustedLedger: null,
+          knownGaps: 0,
+          projectionGeneration: CURRENT_PROJECTION_GENERATION,
+        },
       }),
     };
   }

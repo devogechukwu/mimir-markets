@@ -26,6 +26,9 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   const rawSubscriber = req.nextUrl.searchParams.get("subscriber") ?? "";
+  const rawClaimId = req.nextUrl.searchParams.get("claimId");
+  const includePreviews = req.nextUrl.searchParams.get("preview") === "true";
+
   const ip = clientIpFrom(req.headers);
   const gate = await authorizeRequest("public_read", { route: "/api/baskets/mirrors", ip });
   if (!gate.allowed && gate.error) {
